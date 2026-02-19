@@ -3,6 +3,8 @@ import {
   GitHubClient,
   type PullRequestReviewComment,
   type PullRequestReview,
+  type Issue,
+  type IssueComment,
 } from "./lib/github.js";
 import { encoding_for_model } from "tiktoken";
 
@@ -258,6 +260,62 @@ function formatCommentsWithReviews(
   return markdown;
 }
 
+function formatIssueAsMarkdown(
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  issue: Issue | null,
+  comments: IssueComment[]
+): string {
+  // Calculate tokens
+  let totalTokens = 0;
+  if (issue && issue.body) {
+    totalTokens += countTokens(issue.body);
+  }
+  comments.forEach(comment => {
+    totalTokens += countTokens(comment.body);
+  });
+
+  let markdown = `# Issue #${issueNumber} Comments\n\n`;
+  markdown += `**Repository:** ${owner}/${repo}\n`;
+  markdown += `**Total Comments:** ${comments.length}\n`;
+  markdown += `**Total Tokens:** ${totalTokens.toLocaleString()}\n\n`;
+  markdown += `---\n\n`;
+
+  if (issue) {
+    markdown += `## Issue Description\n\n`;
+    markdown += `**Title:** ${issue.title}\n`;
+    markdown += `**Author:** @${issue.user.login}\n`;
+    markdown += `**Created:** ${new Date(issue.created_at).toLocaleString()}\n`;
+    markdown += `**State:** ${issue.state}\n`;
+    markdown += `**[View on GitHub](${issue.html_url})**\n\n`;
+    markdown += `### Description\n\n`;
+    markdown += `${issue.body || "*No description*"}\n\n`;
+    markdown += `---\n\n`;
+  }
+
+  if (comments.length === 0 && !issue) {
+     markdown += `*No comments found for this issue.*\n`;
+     return markdown;
+  }
+
+  comments.forEach((comment, index) => {
+    markdown += `## Comment ${index + 1}\n\n`;
+    markdown += `**Author:** @${comment.user.login}\n`;
+    markdown += `**Created:** ${new Date(comment.created_at).toLocaleString()}\n`;
+    markdown += `**[View on GitHub](${comment.html_url})**\n\n`;
+
+    markdown += `### Comment\n\n`;
+    markdown += `${comment.body}\n\n`;
+
+    if (index < comments.length - 1) {
+      markdown += `---\n\n`;
+    }
+  });
+
+  return markdown;
+}
+
 // Health check endpoint
 app.get("/health", (req: Request, res: Response) => {
   res.status(200).send("OK");
@@ -377,6 +435,101 @@ async function handlePRComments(
   }
 }
 
+// Handler function for Issue comments
+async function handleIssueComments(
+  owner: string,
+  repo: string,
+  issueNumber: string,
+  commentNumber: string | undefined,
+  token: string,
+  res: Response
+) {
+  // Validate required parameters
+  if (!owner || !repo || !issueNumber) {
+    const errorMarkdown = `# Error 400\n\nMissing required parameters.\n\nExpected: /:owner/:repo/issues/:issueNumber`;
+    return res.status(400)
+      .set("Content-Type", "text/markdown; charset=utf-8")
+      .send(errorMarkdown);
+  }
+
+  // Validate issueNumber is a number
+  const issueNum = parseInt(issueNumber, 10);
+  if (isNaN(issueNum)) {
+    const errorMarkdown = `# Error 400\n\nInvalid issue number.\n\n**Received:** ${issueNumber}\n\nIssue number must be a number.`;
+    return res.status(400)
+      .set("Content-Type", "text/markdown; charset=utf-8")
+      .send(errorMarkdown);
+  }
+
+  // Validate commentNumber if provided
+  let commentNum: number | null = null;
+  if (commentNumber) {
+    commentNum = parseInt(commentNumber, 10);
+    if (isNaN(commentNum)) {
+      const errorMarkdown = `# Error 400\n\nInvalid comment number.\n\n**Received:** ${commentNumber}\n\nComment number must be a number.`;
+      return res.status(400)
+        .set("Content-Type", "text/markdown; charset=utf-8")
+        .send(errorMarkdown);
+    }
+  }
+
+  if (!token) {
+    const errorMarkdown = `# Error 401\n\nMissing GitHub token.\n\n**Options:**\n- Set \`GITHUB_TOKEN\` environment variable\n- Pass token as query parameter: \`?token=your_token\``;
+    return res.status(401)
+      .set("Content-Type", "text/markdown; charset=utf-8")
+      .send(errorMarkdown);
+  }
+
+  try {
+    const client = new GitHubClient(token);
+    let comments = await client.getIssueComments(owner, repo, issueNum);
+    let issue: Issue | null = null;
+
+    if (commentNum !== null) {
+      if (commentNum < 1 || commentNum > comments.length) {
+        const errorMarkdown = `# Error 404\n\nComment not found.\n\n**Comment Number:** ${commentNum}\n**Issue:** #${issueNum}\n**Total Comments:** ${comments.length}\n\nComment number must be between 1 and ${comments.length}.`;
+        return res.status(404)
+          .set("Content-Type", "text/markdown; charset=utf-8")
+          .send(errorMarkdown);
+      }
+      comments = [comments[commentNum - 1]!];
+    } else {
+        // Fetch issue details only if not fetching a specific comment (or maybe fetch it anyway?)
+        // Fetching it anyway to include in the full view
+        issue = await client.getIssue(owner, repo, issueNum);
+    }
+
+    const markdown = formatIssueAsMarkdown(owner, repo, issueNum, issue, comments);
+
+    return res.status(200)
+      .set("Content-Type", "text/markdown; charset=utf-8")
+      .send(markdown);
+
+  } catch (error) {
+    console.error("Error fetching issue comments:", error);
+
+    const errorMarkdown = `# Error\n\nFailed to fetch issue comments.\n\n**Details:** ${error instanceof Error ? error.message : String(error)}`;
+
+    return res.status(500)
+      .set("Content-Type", "text/markdown; charset=utf-8")
+      .send(errorMarkdown);
+  }
+}
+
+// Route: Get specific issue comment by number
+app.get("/:owner/:repo/issues/:issueNumber/:commentNumber", async (req: Request, res: Response) => {
+  const { owner, repo, issueNumber, commentNumber } = req.params;
+  const token = (req.query.token as string) || process.env.GITHUB_TOKEN || "";
+  return handleIssueComments(owner, repo, issueNumber, commentNumber, token, res);
+});
+
+// Route: Get all issue comments
+app.get("/:owner/:repo/issues/:issueNumber", async (req: Request, res: Response) => {
+  const { owner, repo, issueNumber } = req.params;
+  const token = (req.query.token as string) || process.env.GITHUB_TOKEN || "";
+  return handleIssueComments(owner, repo, issueNumber, undefined, token, res);
+});
+
 // Route: Get specific comment by number
 app.get("/:owner/:repo/pull/:pullRequestId/:commentNumber", async (req: Request, res: Response) => {
   const { owner, repo, pullRequestId, commentNumber } = req.params;
@@ -425,24 +578,24 @@ app.get("/:owner/:repo/pull/:pullRequestId", async (req: Request, res: Response)
 
 // 404 handler for all other routes
 app.use((req: Request, res: Response) => {
-  const errorMarkdown = `# Error 404\n\nRoute not found.\n\n**Expected formats:**\n- \`/:repoOwner/:repoName/pull/:id\` - Get all comments\n- \`/:repoOwner/:repoName/pull/:id/:commentNumber\` - Get specific comment by number (1, 2, 3...)\n\n**Examples:**\n- \`/inboundemail/inbound/pull/142\` - Get all comments\n- \`/inboundemail/inbound/pull/142/5\` - Get the 5th comment`;
+  const errorMarkdown = `# Error 404\n\nRoute not found.\n\n**Expected formats:**\n- \`/:repoOwner/:repoName/pull/:id\` - Get all comments\n- \`/:repoOwner/:repoName/pull/:id/:commentNumber\` - Get specific comment by number (1, 2, 3...)\n- \`/:repoOwner/:repoName/issues/:id\` - Get all issue comments\n- \`/:repoOwner/:repoName/issues/:id/:commentNumber\` - Get specific issue comment by number (1, 2, 3...)\n\n**Examples:**\n- \`/inboundemail/inbound/pull/142\` - Get all comments\n- \`/inboundemail/inbound/pull/142/5\` - Get the 5th comment`;
   
   res.status(404)
     .set("Content-Type", "text/markdown; charset=utf-8")
     .send(errorMarkdown);
 });
 
-// Only start server if not in Vercel environment
-if (process.env.NODE_ENV !== "production") {
+// Only start server if not in Vercel environment and not in test environment
+if (process.env.NODE_ENV !== "production" && process.env.NODE_ENV !== "test") {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
     console.log(`\nExamples:`);
     console.log(`  All comments: http://localhost:${PORT}/inboundemail/inbound/pull/142`);
     console.log(`  Single comment: http://localhost:${PORT}/inboundemail/inbound/pull/142/5`);
+    console.log(`  All issue comments: http://localhost:${PORT}/inboundemail/inbound/issues/142`);
   });
 }
 
 // Export for Vercel
 export default app;
-

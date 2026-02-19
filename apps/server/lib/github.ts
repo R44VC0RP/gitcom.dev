@@ -119,11 +119,127 @@ export interface PullRequestReview {
   };
 }
 
+export interface Issue {
+  id: number;
+  node_id: string;
+  url: string;
+  repository_url: string;
+  labels_url: string;
+  comments_url: string;
+  events_url: string;
+  html_url: string;
+  number: number;
+  state: string;
+  title: string;
+  body: string | null;
+  user: SimpleUser;
+  labels: any[]; // Use any[] for simplicity unless specific label structure is needed
+  assignee: SimpleUser | null;
+  assignees: SimpleUser[];
+  milestone: any | null;
+  locked: boolean;
+  active_lock_reason: string | null;
+  comments: number;
+  pull_request?: {
+    url: string;
+    html_url: string;
+    diff_url: string;
+    patch_url: string;
+  };
+  closed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  author_association: AuthorAssociation;
+  reactions: ReactionRollup;
+}
+
+export interface IssueComment {
+  url: string;
+  html_url: string;
+  issue_url: string;
+  id: number;
+  node_id: string;
+  user: SimpleUser;
+  created_at: string;
+  updated_at: string;
+  author_association: AuthorAssociation;
+  body: string;
+  reactions?: ReactionRollup;
+  performed_via_github_app?: any;
+}
+
 export interface GitHubPRCommentsOptions {
   owner: string;
   repo: string;
   pullRequestId: number;
   token: string;
+}
+
+export interface GitHubIssueOptions {
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  token: string;
+}
+
+/**
+ * Helper function to fetch paginated results from GitHub API
+ *
+ * @param url - The initial URL to fetch
+ * @param token - GitHub personal access token
+ * @returns Array of accumulated results
+ */
+async function fetchPaginated<T>(url: string, token: string): Promise<T[]> {
+  let results: T[] = [];
+  let nextUrl: string | null = url;
+
+  while (nextUrl) {
+    const response = await fetch(nextUrl, {
+      method: "GET",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `GitHub API request failed: ${response.status} ${response.statusText}\n${errorText}`
+      );
+    }
+
+    const data = await response.json();
+    results = results.concat(data as T[]);
+
+    // Check for Link header to handle pagination
+    const linkHeader = response.headers.get("link");
+    const currentUrl = nextUrl; // Store current URL to compare
+    nextUrl = null;
+
+    if (linkHeader) {
+      const links = linkHeader.split(",");
+      for (const link of links) {
+        const parts = link.split(";");
+        if (parts.length < 2) continue;
+
+        const urlPart = parts[0]!;
+        const relPart = parts[1]!;
+
+        if (relPart.includes('rel="next"')) {
+          const newUrl = urlPart.trim().slice(1, -1);
+          // Avoid infinite loop if next URL is same as current (shouldn't happen with correct API)
+          if (newUrl !== currentUrl) {
+              nextUrl = newUrl;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return results;
 }
 
 /**
@@ -137,27 +253,8 @@ export async function fetchPullRequestComments(
   options: GitHubPRCommentsOptions
 ): Promise<PullRequestReviewComment[]> {
   const { owner, repo, pullRequestId, token } = options;
-
-  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestId}/comments`;
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `GitHub API request failed: ${response.status} ${response.statusText}\n${errorText}`
-    );
-  }
-
-  const data = await response.json();
-  return data as PullRequestReviewComment[];
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestId}/comments?per_page=100`;
+  return fetchPaginated<PullRequestReviewComment>(url, token);
 }
 
 /**
@@ -171,8 +268,23 @@ export async function fetchPullRequestReviews(
   options: GitHubPRCommentsOptions
 ): Promise<PullRequestReview[]> {
   const { owner, repo, pullRequestId, token } = options;
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestId}/reviews?per_page=100`;
+  return fetchPaginated<PullRequestReview>(url, token);
+}
 
-  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestId}/reviews`;
+/**
+ * Fetches an issue by number
+ *
+ * @param options - Configuration options for the API request
+ * @returns The Issue object
+ * @throws Error if the API request fails
+ */
+export async function fetchIssue(
+  options: GitHubIssueOptions
+): Promise<Issue> {
+  const { owner, repo, issueNumber, token } = options;
+
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -191,7 +303,22 @@ export async function fetchPullRequestReviews(
   }
 
   const data = await response.json();
-  return data as PullRequestReview[];
+  return data as Issue;
+}
+
+/**
+ * Fetches all comments for a specific Issue
+ *
+ * @param options - Configuration options for the API request
+ * @returns Array of Issue Comments
+ * @throws Error if the API request fails
+ */
+export async function fetchIssueComments(
+  options: GitHubIssueOptions
+): Promise<IssueComment[]> {
+  const { owner, repo, issueNumber, token } = options;
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=100`;
+  return fetchPaginated<IssueComment>(url, token);
 }
 
 /**
@@ -266,5 +393,46 @@ export class GitHubClient {
 
     return { reviews, comments };
   }
-}
 
+  /**
+   * Fetches an issue by number
+   *
+   * @param owner - Repository owner
+   * @param repo - Repository name
+   * @param issueNumber - Issue number
+   * @returns The Issue object
+   */
+  async getIssue(
+    owner: string,
+    repo: string,
+    issueNumber: number
+  ): Promise<Issue> {
+    return fetchIssue({
+      owner,
+      repo,
+      issueNumber,
+      token: this.token,
+    });
+  }
+
+  /**
+   * Fetches all comments for a specific Issue
+   *
+   * @param owner - Repository owner
+   * @param repo - Repository name
+   * @param issueNumber - Issue number
+   * @returns Array of Issue Comments
+   */
+  async getIssueComments(
+    owner: string,
+    repo: string,
+    issueNumber: number
+  ): Promise<IssueComment[]> {
+    return fetchIssueComments({
+      owner,
+      repo,
+      issueNumber,
+      token: this.token,
+    });
+  }
+}
